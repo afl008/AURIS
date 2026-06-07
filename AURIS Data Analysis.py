@@ -1,4 +1,5 @@
 import os
+import shutil
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -80,6 +81,45 @@ def clean_ecg_signal(data, fs):
     b_hi, a_hi = butter(2, 0.5/(fs/2), btype='high')
     return filtfilt(b_hi, a_hi, data_notched)
 
+def clean_rr_for_hrv(rr, low=0.10, high=0.35, max_rel_dev=0.20):
+    rr = np.asarray(rr)
+    rr_f = rr[(rr >= low) & (rr <= high)]
+    if len(rr_f) < 5:
+        return rr_f
+    med = np.median(rr_f)
+    return rr_f[np.abs(rr_f - med) / med <= max_rel_dev]
+
+def dfa_alpha(rr):
+    x = rr - np.mean(rr)
+    y = np.cumsum(x)
+    N = len(x)
+    n_vals = np.unique(np.logspace(np.log10(4), np.log10(max(N // 4, 5)), 12).astype(int))
+    F = []
+    valid_n = []
+    for n in n_vals:
+        if n < 3:
+            continue
+        segs = N // n
+        if segs < 2:
+            continue
+        rms = []
+        for i in range(segs):
+            seg = y[i*n:(i+1)*n]
+            t = np.arange(n)
+            p = np.polyfit(t, seg, 1)
+            rms.append(np.sqrt(np.mean((seg - (p[0]*t + p[1]))**2)))
+        F.append(np.mean(rms))
+        valid_n.append(n)
+    n_vals = np.array(valid_n)
+    F = np.array(F)
+    if len(F) < 3:
+        return np.nan, np.nan
+    short = n_vals <= 16
+    long_ = n_vals > 16
+    a1 = np.polyfit(np.log(n_vals[short]), np.log(F[short]), 1)[0] if short.sum() > 2 else np.nan
+    a2 = np.polyfit(np.log(n_vals[long_]), np.log(F[long_]), 1)[0] if long_.sum() > 2 else np.nan
+    return a1, a2
+
 def qrs_filter(ecg, fs, bp_band=(0.1,200), env_smooth_ms=4, mad_k=1.5, refractory_ms=80, min_rr_ms=40, max_rr_ms=400):
     x = ecg - np.mean(ecg)
     nyq = fs/2
@@ -158,48 +198,80 @@ def compute_hrv(rr):
     diff_ms = np.diff(rr*1000)
     out["sd1"] = np.sqrt(0.5)*np.std(diff_ms, ddof=1)
     out["sd2"] = np.sqrt(2*np.std(rr*1000, ddof=1)**2 - 0.5*np.std(diff_ms, ddof=1)**2)
+    out["sd1_sd2_ratio"] = out["sd1"] / out["sd2"] if out["sd2"] else np.nan
     out["sample_entropy"] = sample_entropy(rr)
+    a1, a2 = dfa_alpha(rr)
+    out["dfa_alpha_I"]    = a1
+    out["dfa_alpha_II"]   = a2
+    out["dfa_alpha_ratio"] = a1 / a2 if (a1 and a2) else np.nan
     return out
 
 # ============================================
 # 4. EXECUTION PIPELINE
 # ============================================
 
-print("Loading data...")
-blk = tdt.read_block(block_path, store=store)
-fs = int(blk.streams[store].fs)
-X_adj = auto_invert(np.asarray(blk.streams[store].data)[[i-1 for i in channels]], fs, channels)
+def run_trial(block_path, start_time_s=0, end_time_s=10000, stim_intervals=None,
+              store="EEGw", channels=None, outdir=None, label=None):
+    if stim_intervals is None:
+        stim_intervals = []
+    if channels is None:
+        channels = [1, 2, 3, 4]
+    if outdir is None:
+        outdir = f"{block_path}/analysis_output_Rodent_I"
+    if label is None:
+        label = os.path.basename(block_path)
 
-t_all = np.arange(X_adj.shape[1])/fs
-mask = (t_all >= start_time_s) & (t_all <= end_time_s)
-CHEST, EAR = clean_ecg_signal(np.mean(X_adj[0:2, mask], axis=0), fs), clean_ecg_signal(np.mean(X_adj[2:4, mask], axis=0), fs)
-t = t_all[mask] - t_all[mask][0]
+    if os.path.exists(outdir):
+        shutil.rmtree(outdir)
+    os.makedirs(outdir)
 
-print("Detecting peaks...")
-rr_c, hr_c, Rl_c, tpk_c = qrs_filter(CHEST, fs)
-rr_e, hr_e, Rl_e, tpk_e = qrs_filter(EAR, fs)
+    print(f"\n=== {label} ===")
+    print("Loading data...")
+    blk = tdt.read_block(block_path, store=store)
+    fs = int(blk.streams[store].fs)
+    X_adj = auto_invert(np.asarray(blk.streams[store].data)[[i-1 for i in channels]], fs, channels)
 
-# Build Analysis Table
-rows = []
-for event in stim_intervals:
-    for site, tpk in [("CHEST", tpk_c), ("EAR", tpk_e)]:
-        m = (tpk >= event["start"]) & (tpk <= event["end"])
-        if np.sum(m) > 5:
-            hrv = compute_hrv(np.diff(tpk[m]))
-            rows.append(dict(window=event["label"], site=site, **{k: hrv.get(k, np.nan) for k in HRV_UNITS}))
+    t_all = np.arange(X_adj.shape[1]) / fs
+    mask  = (t_all >= start_time_s) & (t_all <= end_time_s)
+    CHEST = clean_ecg_signal(np.mean(X_adj[0:2, mask], axis=0), fs)
+    EAR   = clean_ecg_signal(np.mean(X_adj[2:4, mask], axis=0), fs)
 
-df_stim = pd.DataFrame(rows)
-df_stim.to_csv(f"{outdir}/Stimulation_Analysis_Summary.csv", index=False)
+    print("Detecting peaks...")
+    rr_c, hr_c, Rl_c, tpk_c = qrs_filter(CHEST, fs)
+    rr_e, hr_e, Rl_e, tpk_e = qrs_filter(EAR, fs)
 
-# Quick Plot: Global Heart Rate
-fig, ax = plt.subplots(figsize=(15, 5))
-ax.plot(tpk_c[1:], hr_c, 'k', alpha=0.3, label="Chest HR")
-for event in stim_intervals:
-    ax.axvspan(event["start"], event["end"], color='red' if "On" in event["label"] else 'gray', alpha=0.15)
-ax.set_title("Global Heart Rate & Stimulation Overlays")
-save_plot(fig, f"{outdir}/Global_HR_Summary.png")
+    rows = []
+    for event in stim_intervals:
+        for site, tpk in [("CHEST", tpk_c), ("EAR", tpk_e)]:
+            m = (tpk >= event["start"]) & (tpk <= event["end"])
+            if np.sum(m) > 5:
+                hrv = compute_hrv(clean_rr_for_hrv(np.diff(tpk[m])))
+                rows.append(dict(window=event["label"], site=site, **{k: hrv.get(k, np.nan) for k in HRV_UNITS}))
 
-print(f"Analysis complete. Results saved to: {outdir}")
+    pd.DataFrame(rows).to_csv(f"{outdir}/Stimulation_Analysis_Summary.csv", index=False)
+
+    fig, ax = plt.subplots(figsize=(15, 5))
+    ax.plot(tpk_c[1:], hr_c, 'k', alpha=0.3, label="Chest HR")
+    for event in stim_intervals:
+        ax.axvspan(event["start"], event["end"],
+                   color='red' if "On" in event["label"] else 'gray', alpha=0.15)
+    ax.set_title(f"Global Heart Rate & Stimulation Overlays — {label}")
+    save_plot(fig, f"{outdir}/Global_HR_Summary.png")
+
+    print(f"Results saved to: {outdir}")
+
+
+# If local_config defines a `trials` list, run each; otherwise fall back to single-block defaults.
+try:
+    trials
+except NameError:
+    trials = [dict(block_path=block_path, start_time_s=start_time_s, end_time_s=end_time_s,
+                   stim_intervals=stim_intervals, store=store, channels=channels, outdir=outdir)]
+
+for trial in trials:
+    run_trial(**trial)
+
+print("\nAll trials complete.")
 
 
 
