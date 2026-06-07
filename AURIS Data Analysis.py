@@ -11,19 +11,25 @@ from scipy.stats import ttest_ind
 from sklearn.neighbors import KDTree
 
 # ============================================
-# 1. USER CONFIGURATION (Replace with your session info)
+# 1. USER CONFIGURATION
+# Personal sessions: copy local_config.example.py → local_config.py and fill it in.
+# local_config.py is gitignored and overrides every default below.
 # ============================================
-block_path   = "PASTE_YOUR_PATH_HERE"
-start_time_s = 0
-end_time_s   = 10000 
-stim_intervals = [
-    # Example format: {"label": "Baseline", "start": 0, "end": 60},
-]
+block_path     = "PASTE_YOUR_PATH_HERE"
+start_time_s   = 0
+end_time_s     = 10000
+stim_intervals = []
+store          = "EEGw"
+channels       = [1, 2, 3, 4]  # Chest=1–2, Ear=3–4
+outdir         = None           # set below after possible override
 
-# Analysis settings
-store      = "EEGw"
-channels   = [1, 2, 3, 4]  # Chest=1–2, Ear=3–4
-outdir     = f"{block_path}/analysis_output_Rodent_I"
+try:
+    from local_config import *  # noqa: F401, F403
+except ImportError:
+    pass
+
+if outdir is None:
+    outdir = f"{block_path}/analysis_output_Rodent_I"
 os.makedirs(outdir, exist_ok=True)
 
 plt.rcParams.update({

@@ -34,22 +34,32 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Open `AURIS Data Analysis.py` and edit the **User Configuration** block at the top:
+Session configuration is kept in a **gitignored** `local_config.py` so your personal paths and intervals never appear in version history.
+
+```bash
+cp local_config.example.py local_config.py
+```
+
+Then edit `local_config.py`:
 
 ```python
-block_path   = "/path/to/your/TDT/block"   # path to the .Tbk block folder
-start_time_s = 0                            # analysis window start (seconds)
-end_time_s   = 10000                        # analysis window end (seconds)
+block_path   = "/path/to/your/TDT/block"
+start_time_s = 0
+end_time_s   = 10000
 
 stim_intervals = [
-    {"label": "Baseline",   "start":   0, "end":  60},
-    {"label": "Stim On",    "start":  60, "end": 120},
-    {"label": "Recovery",   "start": 120, "end": 180},
+    {"label": "Baseline", "start":   0, "end":  60},
+    {"label": "Stim On",  "start":  60, "end": 120},
+    {"label": "Recovery", "start": 120, "end": 180},
 ]
 
-store    = "EEGw"       # TDT store name
-channels = [1, 2, 3, 4] # Chest = 1–2, Ear = 3–4
+# Optional overrides
+# store    = "EEGw"
+# channels = [1, 2, 3, 4]   # Chest=1–2, Ear=3–4
+# outdir   = f"{block_path}/my_custom_output"
 ```
+
+Any variable defined in `local_config.py` overrides the default in the main script. Omit lines you don't need to change. If `local_config.py` is absent, the script runs with template defaults.
 
 ## Running
 
