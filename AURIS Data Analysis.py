@@ -81,12 +81,24 @@ def clean_ecg_signal(data, fs):
     b_hi, a_hi = butter(2, 0.5/(fs/2), btype='high')
     return filtfilt(b_hi, a_hi, data_notched)
 
-def clean_rr_for_hrv(rr, low=0.10, high=0.35, max_rel_dev=0.20):
+def clean_rr_for_hrv(rr, low=0.10, high=0.35, max_rel_dev=0.20, reference_rr=None):
+    """Filter RR intervals to a physiological band, then reject outliers relative to
+    a central rate. By default the central rate is the local median (self-referenced).
+
+    When reference_rr is supplied (the simultaneous chest median for this window),
+    it anchors the deviation test instead — this rejects ear T-wave false detections
+    that the local median would otherwise lock onto, using the trusted lead's known
+    heart rate as a physiological prior. A wider band is allowed in this mode to
+    preserve genuine beat-to-beat variation around the anchored rate."""
     rr = np.asarray(rr)
     rr_f = rr[(rr >= low) & (rr <= high)]
     if len(rr_f) < 5:
         return rr_f
-    med = np.median(rr_f)
+    if reference_rr is not None:
+        med = reference_rr
+        max_rel_dev = max(max_rel_dev, 0.30)
+    else:
+        med = np.median(rr_f)
     return rr_f[np.abs(rr_f - med) / med <= max_rel_dev]
 
 def dfa_alpha(rr):
@@ -126,11 +138,11 @@ def qrs_filter(ecg, fs, bp_band=(0.1,200), env_smooth_ms=4, mad_k=1.5, refractor
     b,a = butter(2,[bp_band[0]/nyq, bp_band[1]/nyq], btype="bandpass")
     y = filtfilt(b,a,x)
     y /= (np.percentile(np.abs(y),97) + 1e-12)
-    
+
     env = np.abs(y)
     win = max(int((env_smooth_ms/1000)*fs),3)
     env = np.convolve(env, np.ones(win)/win, mode="same")
-    
+
     win_med = int(0.15*fs) | 1
     medv = medfilt(env, win_med)
     madv = medfilt(np.abs(env-medv), win_med)
@@ -238,14 +250,142 @@ def run_trial(block_path, start_time_s=0, end_time_s=10000, stim_intervals=None,
 
     print("Detecting peaks...")
     rr_c, hr_c, Rl_c, tpk_c = qrs_filter(CHEST, fs)
-    rr_e, hr_e, Rl_e, tpk_e = qrs_filter(EAR, fs)
+    rr_e, hr_e, Rl_e, tpk_e = qrs_filter(EAR,   fs)
+
+    # ── Diagnostic peak-detection panel ──────────────────────────────────────
+    # 6 rows: for each of Chest and Ear — raw ECG + bandpass-filtered signal
+    #         with detected peaks, shown in two windows: early in recording and
+    #         at first stim interval. Then RR timeseries and histogram.
+    t_sig = np.arange(len(CHEST)) / fs
+
+    # Compute the bandpass-filtered signal the QRS detector actually uses.
+    def _bandpass(sig, fs, lo=0.1, hi=200):
+        from scipy.signal import butter, filtfilt
+        nyq = fs / 2
+        b, a = butter(2, [lo/nyq, hi/nyq], btype="bandpass")
+        y = filtfilt(b, a, sig - np.mean(sig))
+        y /= (np.percentile(np.abs(y), 97) + 1e-12)
+        return y
+
+    bp_c = _bandpass(CHEST, fs)
+    bp_e = _bandpass(EAR,   fs)
+
+    # Two 10-second windows: start of recording and start of first stim interval.
+    early_start = start_time_s + 5.0
+    stim_start  = stim_intervals[0]["start"] if stim_intervals else early_start + 60.0
+    windows = [
+        (early_start,       early_start + 10.0, "Early baseline"),
+        (stim_start,        stim_start  + 10.0, "First stim onset"),
+    ]
+
+    fig = plt.figure(figsize=(22, 26))
+    fig.suptitle(f"Peak Detection Diagnostic — {label}", fontsize=18)
+    gs = fig.add_gridspec(6, 2, hspace=0.5, wspace=0.35)
+
+    # Mark which peaks survive clean_rr_for_hrv so the diagnostic colours match the
+    # cleaner applied before HRV computation. Ear is anchored to the chest median
+    # (as in the per-window table logic), using a global chest median here for the
+    # whole-recording overview.
+    def _cleaned_peak_mask(tpk, reference_rr=None, low=0.10, high=0.35, max_rel_dev=0.20):
+        if len(tpk) < 2:
+            return np.zeros(len(tpk), dtype=bool)
+        rr = np.diff(tpk)
+        in_bounds = (rr >= low) & (rr <= high)
+        if reference_rr is not None:
+            med = reference_rr
+            max_rel_dev = max(max_rel_dev, 0.30)
+        else:
+            med = np.median(rr[in_bounds]) if in_bounds.sum() >= 5 else None
+        if med is not None:
+            clean = in_bounds & (np.abs(rr - med) / med <= max_rel_dev)
+        else:
+            clean = in_bounds
+        used = np.zeros(len(tpk), dtype=bool)
+        for i in np.where(clean)[0]:
+            used[i]     = True
+            used[i + 1] = True
+        return used
+
+    chest_global_ref = float(np.median(clean_rr_for_hrv(rr_c))) if len(rr_c) > 10 else None
+    used_c = _cleaned_peak_mask(tpk_c)
+    used_e = _cleaned_peak_mask(tpk_e, reference_rr=chest_global_ref)
+
+    for row, (site, raw_sig, bp_sig, tpk, used, color) in enumerate([
+        ("Chest", CHEST, bp_c, tpk_c, used_c, "steelblue"),
+        ("Ear",   EAR,   bp_e, tpk_e, used_e, "firebrick"),
+    ]):
+        for col, (ws, we, wlabel) in enumerate(windows):
+            ax  = fig.add_subplot(gs[row*2,     col])
+            ax2 = fig.add_subplot(gs[row*2 + 1, col], sharex=ax)
+
+            wm  = (t_sig >= ws) & (t_sig <= we)
+            pm  = (tpk   >= ws) & (tpk   <= we)
+            pm_used     = pm & used
+            pm_filtered = pm & ~used
+
+            for ax_i, sig_i in [(ax, raw_sig), (ax2, bp_sig)]:
+                ax_i.plot(t_sig[wm], sig_i[wm], color=color, lw=0.8, alpha=0.7)
+                if pm_filtered.any():
+                    filt_idx = (tpk[pm_filtered] * fs).astype(int).clip(0, len(sig_i)-1)
+                    ax_i.plot(tpk[pm_filtered], sig_i[filt_idx],
+                              'x', color='gray', ms=7, mew=1.5, zorder=4, label="Filtered out")
+                if pm_used.any():
+                    used_idx = (tpk[pm_used] * fs).astype(int).clip(0, len(sig_i)-1)
+                    ax_i.plot(tpk[pm_used], sig_i[used_idx],
+                              'v', color='black', ms=7, zorder=5, label="Used for HRV")
+
+            rr_w = np.diff(tpk[pm_used]) * 1000
+            n_used = pm_used.sum()
+            n_filt = pm_filtered.sum()
+            mrr = f"{rr_w.mean():.0f} ms ({60000/rr_w.mean():.0f} bpm)" if len(rr_w) else "—"
+            ax.set_title(f"{site} — {wlabel} (raw ECG)  |  ▼ used: {n_used}  ✗ filtered: {n_filt}", fontsize=9)
+            ax.set_ylabel("Amplitude")
+            ax.legend(fontsize=8, loc="upper right")
+            plt.setp(ax.get_xticklabels(), visible=False)
+            ax2.set_title(f"Bandpass  |  mean RR (used) = {mrr}", fontsize=9)
+            ax2.set_xlabel("Time (s)")
+            ax2.set_ylabel("Norm. amplitude")
+
+    # RR interval timeseries (row 4)
+    ax = fig.add_subplot(gs[4, :])
+    if len(rr_c): ax.plot(tpk_c[1:], rr_c*1000, color="steelblue", lw=0.6, alpha=0.7, label="Chest")
+    if len(rr_e): ax.plot(tpk_e[1:], rr_e*1000, color="firebrick", lw=0.6, alpha=0.7, label="Ear")
+    for event in stim_intervals:
+        ax.axvspan(event["start"], event["end"],
+                   color="red" if "_On" in event["label"] else "gray", alpha=0.08)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("RR interval (ms)")
+    ax.set_title("RR Interval Timeseries — full recording")
+    ax.legend(loc="upper right", fontsize=11)
+
+    # RR histogram (row 5)
+    ax = fig.add_subplot(gs[5, :])
+    bins = np.linspace(50, 600, 80)
+    if len(rr_c): ax.hist(rr_c*1000, bins=bins, color="steelblue", alpha=0.6, label="Chest")
+    if len(rr_e): ax.hist(rr_e*1000, bins=bins, color="firebrick", alpha=0.6, label="Ear")
+    ax.axvspan(100, 350, color="green", alpha=0.08, label="clean_rr_for_hrv bounds")
+    ax.set_xlabel("RR interval (ms)")
+    ax.set_ylabel("Count")
+    ax.set_title("RR Interval Distribution")
+    ax.legend(loc="upper right", fontsize=11)
+
+    save_plot(fig, f"{outdir}/Diagnostic_Peak_Detection.png")
+    print("  Diagnostic panel saved.")
+    # ─────────────────────────────────────────────────────────────────────────
 
     rows = []
     for event in stim_intervals:
+        # Chest first: its cleaned median is this window's heart-rate reference,
+        # used to anchor ear cleaning (rejects ear T-wave double-detections).
+        mc = (tpk_c >= event["start"]) & (tpk_c <= event["end"])
+        chest_rr = clean_rr_for_hrv(np.diff(tpk_c[mc])) if np.sum(mc) > 5 else np.array([])
+        chest_ref = float(np.median(chest_rr)) if len(chest_rr) >= 5 else None
+
         for site, tpk in [("CHEST", tpk_c), ("EAR", tpk_e)]:
             m = (tpk >= event["start"]) & (tpk <= event["end"])
             if np.sum(m) > 5:
-                hrv = compute_hrv(clean_rr_for_hrv(np.diff(tpk[m])))
+                ref = chest_ref if site == "EAR" else None
+                hrv = compute_hrv(clean_rr_for_hrv(np.diff(tpk[m]), reference_rr=ref))
                 rows.append(dict(window=event["label"], site=site, **{k: hrv.get(k, np.nan) for k in HRV_UNITS}))
 
     pd.DataFrame(rows).to_csv(f"{outdir}/Stimulation_Analysis_Summary.csv", index=False)

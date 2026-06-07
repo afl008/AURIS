@@ -8,8 +8,9 @@ Analysis pipeline for rodent cardiac data acquired via Tucker-Davis Technologies
 - Auto-corrects signal polarity across channels
 - Applies a 60 Hz notch filter and 0.5 Hz high-pass to clean each channel
 - Detects R-peaks with an adaptive MAD threshold + refractory-period filter
+- Cleans the RR series (physiological band + outlier rejection), with the ear channel anchored to the simultaneous chest heart rate per window — see [RR cleaning & chest anchoring](#rr-cleaning--chest-anchoring)
 - Computes **time-domain**, **frequency-domain**, and **nonlinear** HRV metrics per stimulation interval
-- Saves results to CSV and a heart rate overview plot
+- Saves results to CSV, a heart-rate overview plot, and a per-trial peak-detection diagnostic panel
 
 ### HRV metrics computed
 
@@ -17,7 +18,9 @@ Analysis pipeline for rodent cardiac data acquired via Tucker-Davis Technologies
 |---|---|
 | Time | Mean RR, Mean HR, SDNN, RMSSD, pNN3, pNN5 |
 | Frequency | LF, HF, Total Power, LF/HF ratio |
-| Nonlinear | SD1, SD2, SD1/SD2, Sample Entropy |
+| Nonlinear | SD1, SD2, SD1/SD2, Sample Entropy, DFA α1, DFA α2, DFA α Ratio |
+
+LF, HF, and Total Power are reported in ms².
 
 ## Setup
 
@@ -100,6 +103,42 @@ Outputs are written to `<block_path>/analysis_output_Rodent_I/`:
 |---|---|
 | `Stimulation_Analysis_Summary.csv` | HRV metrics per interval × site |
 | `Global_HR_Summary.png` | Heart rate trace with stimulation overlays |
+| `Diagnostic_Peak_Detection.png` | Per-trial QC panel: raw + bandpass ECG with detected peaks (early-baseline and first-stim windows), RR timeseries, and RR histogram. Peaks used for HRV are marked ▼; peaks rejected by RR cleaning are marked ✗. |
+
+## Methods
+
+### RR cleaning & chest anchoring
+
+Detected R-peaks are converted to RR intervals, then cleaned before any HRV metric is
+computed (`clean_rr_for_hrv`):
+
+1. **Physiological band** — intervals outside 100–350 ms (≈170–600 bpm for rodents) are dropped.
+2. **Outlier rejection** — for the **chest** channel, intervals deviating more than ±20 % from
+   the window's median are dropped (self-referenced).
+3. **Chest anchoring (ear only)** — the **ear** channel is cleaned against the *simultaneous
+   chest median for that same window* rather than its own median, with a ±30 % band.
+
+Anchoring is necessary because the two ear electrodes are weakly coherent
+(inter-electrode r ≈ 0 on some trials vs. r ≈ 0.5–0.85 for chest), so the ear detector
+intermittently locks onto T-waves, producing doubled RR intervals. A self-referenced median
+can land on the doubled rate and report half the true heart rate. Using the trusted chest
+lead's per-window heart rate as a physiological prior rejects these artifacts. The anchor is
+computed **per window** (not globally) so it tracks heart-rate drift across the recording.
+
+### Chest/ear sensor agreement
+
+With per-window chest anchoring, agreement between the two sensors falls into three tiers:
+
+| Tier | Metrics | Agreement |
+|---|---|---|
+| Rate | Mean RR, Mean HR | excellent (≈0–4 %) |
+| Normalized / nonlinear | LF/HF, SD1/SD2, Sample Entropy, DFA α1/α2/Ratio | good (≈2–19 %) |
+| Absolute variance | SDNN, RMSSD, LF, HF, Total Power, SD1, SD2 | ear runs ≈25–250 % higher |
+
+The ear reliably recovers heart **rate** and **normalized** HRV dynamics. Absolute time-domain
+variability is inflated on the ear by residual beat-detection jitter; this is a sensor
+limitation, not a processing artifact — Savitzky–Golay smoothing rescales both channels
+proportionally but does **not** close the gap, so it is intentionally **not** applied.
 
 ## Dependencies
 

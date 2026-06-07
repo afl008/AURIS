@@ -41,3 +41,6 @@ analysis_output*/
 # Secrets / config overrides
 *.env
 local_config.py
+
+# Private analysis outputs & scripts (table generation, comparisons, renders)
+local_analysis/
