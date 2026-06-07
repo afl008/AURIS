@@ -102,6 +102,7 @@ Outputs are written to `<block_path>/analysis_output_Rodent_I/`:
 | File | Description |
 |---|---|
 | `Stimulation_Analysis_Summary.csv` | HRV metrics per interval × site |
+| `Sequential_PrePost_Summary.csv` | HRV of the 5-min rest slices flanking each stim (before onset / after offset) × site — see [Sequential pre/post analysis](#sequential-prepost-analysis) |
 | `Global_HR_Summary.png` | Heart rate trace with stimulation overlays |
 | `Diagnostic_Peak_Detection.png` | Per-trial QC panel: raw + bandpass ECG with detected peaks (early-baseline and first-stim windows), RR timeseries, and RR histogram. Peaks used for HRV are marked ▼; peaks rejected by RR cleaning are marked ✗. |
 
@@ -124,6 +125,21 @@ intermittently locks onto T-waves, producing doubled RR intervals. A self-refere
 can land on the doubled rate and report half the true heart rate. Using the trusted chest
 lead's per-window heart rate as a physiological prior rejects these artifacts. The anchor is
 computed **per window** (not globally) so it tracks heart-rate drift across the recording.
+
+### Sequential pre/post analysis
+
+To assess the effect of a stimulation block, each stim is compared against the *rest
+periods that flank it* rather than against the stim itself (`Sequential_PrePost_Summary.csv`):
+
+- **Before** — up to 5 minutes of the preceding washout, ending at stim onset.
+- **After** — up to 5 minutes of the following washout, starting at stim offset.
+
+The paired contrast is `after − before` (post-stim rest vs. pre-stim rest), so both slices
+are quiescent baselines and no during-stim artifact enters either side. Because each slice is
+drawn from one end of a washout, the *after* slice of one stim and the *before* slice of the
+next come from opposite ends of the same ≥10-min washout — so consecutive brackets share no
+samples and the paired differences remain statistically independent. A stim contributes a pair
+only when both flanking slices exist and span ≥2 minutes.
 
 ### Chest/ear sensor agreement
 

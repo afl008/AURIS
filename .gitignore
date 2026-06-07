@@ -42,5 +42,6 @@ analysis_output*/
 *.env
 local_config.py
 
-# Private analysis outputs & scripts (table generation, comparisons, renders)
+# Private post-processing (table generation, comparisons, renders) — kept local, not public
+tables/
 local_analysis/

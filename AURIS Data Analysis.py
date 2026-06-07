@@ -219,6 +219,68 @@ def compute_hrv(rr):
     return out
 
 # ============================================
+# 3b. SEQUENTIAL PRE/POST (FLANKING-REST) ANALYSIS
+# ============================================
+# For each stimulation window, compute HRV over the rest period immediately
+# *before* stim onset and immediately *after* stim offset. Each slice is taken
+# from the flanking non-stim (rest/washout) window: up to SEQ_SLICE_S seconds
+# ending at onset, and the same span starting at offset. Comparing the two
+# isolates the carryover effect of stimulation between two quiescent baselines,
+# with no during-stim artifact in either slice. Because each slice is drawn from
+# one end of a rest window, the "after" slice of one stim and the "before" slice
+# of the next come from opposite ends of the same washout — so consecutive
+# brackets share no data and the paired differences stay independent.
+
+SEQ_SLICE_S   = 300.0   # flanking rest slice length (5 minutes)
+SEQ_MIN_S     = 120.0   # discard a slice shorter than this (rest window too brief)
+SEQ_MIN_BEATS = 30      # discard a slice with too few cleaned beats
+
+def _slice_hrv(tpk, win, ref=None):
+    """HRV over peaks within the [start, end] time slice, with RR cleaning
+    (ear anchored to the chest reference when ref is supplied)."""
+    m = (tpk >= win[0]) & (tpk <= win[1])
+    if np.sum(m) <= SEQ_MIN_BEATS:
+        return None, int(np.sum(m))
+    rr = clean_rr_for_hrv(np.diff(tpk[m]), reference_rr=ref)
+    if len(rr) < SEQ_MIN_BEATS:
+        return None, len(rr)
+    return compute_hrv(rr), len(rr)
+
+def sequential_prepost_rows(stim_intervals, tpk_c, tpk_e):
+    rows = []
+    for i, ev in enumerate(stim_intervals):
+        if "_On" not in ev["label"]:
+            continue
+        prev_ev = stim_intervals[i - 1] if i > 0 else None
+        next_ev = stim_intervals[i + 1] if i + 1 < len(stim_intervals) else None
+
+        slices = {}
+        if prev_ev is not None and "_On" not in prev_ev["label"]:
+            b0 = max(ev["start"] - SEQ_SLICE_S, prev_ev["start"])
+            if ev["start"] - b0 >= SEQ_MIN_S:
+                slices["before"] = (b0, ev["start"])
+        if next_ev is not None and "_On" not in next_ev["label"]:
+            a1 = min(ev["end"] + SEQ_SLICE_S, next_ev["end"])
+            if a1 - ev["end"] >= SEQ_MIN_S:
+                slices["after"] = (ev["end"], a1)
+
+        for phase, win in slices.items():
+            # Chest first: its cleaned median anchors ear cleaning for this slice.
+            mc = (tpk_c >= win[0]) & (tpk_c <= win[1])
+            chest_rr = clean_rr_for_hrv(np.diff(tpk_c[mc])) if np.sum(mc) > 5 else np.array([])
+            chest_ref = float(np.median(chest_rr)) if len(chest_rr) >= 5 else None
+            for site, tpk in [("CHEST", tpk_c), ("EAR", tpk_e)]:
+                hrv, nb = _slice_hrv(tpk, win, ref=chest_ref if site == "EAR" else None)
+                if hrv is None:
+                    continue
+                rows.append(dict(
+                    stim=ev["label"], phase=phase, site=site,
+                    slice_start=round(win[0], 1), slice_end=round(win[1], 1),
+                    slice_dur_s=round(win[1] - win[0], 1), n_beats=nb,
+                    **{k: hrv.get(k, np.nan) for k in HRV_UNITS}))
+    return rows
+
+# ============================================
 # 4. EXECUTION PIPELINE
 # ============================================
 
@@ -389,6 +451,11 @@ def run_trial(block_path, start_time_s=0, end_time_s=10000, stim_intervals=None,
                 rows.append(dict(window=event["label"], site=site, **{k: hrv.get(k, np.nan) for k in HRV_UNITS}))
 
     pd.DataFrame(rows).to_csv(f"{outdir}/Stimulation_Analysis_Summary.csv", index=False)
+
+    # Sequential pre/post analysis: HRV of the 5-min rest slices flanking each stim.
+    seq_rows = sequential_prepost_rows(stim_intervals, tpk_c, tpk_e)
+    pd.DataFrame(seq_rows).to_csv(f"{outdir}/Sequential_PrePost_Summary.csv", index=False)
+    print(f"  Sequential pre/post slices: {len(seq_rows)} rows.")
 
     fig, ax = plt.subplots(figsize=(15, 5))
     ax.plot(tpk_c[1:], hr_c, 'k', alpha=0.3, label="Chest HR")
